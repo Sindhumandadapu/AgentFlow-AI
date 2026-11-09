@@ -1,0 +1,98 @@
+"""Offline smoke tests for generic AgentFlow planning and evidence retrieval helpers."""
+import sys
+import types
+from pathlib import Path
+
+BACKEND = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(BACKEND))
+
+# Stub external integrations so these tests do not need API credentials/network access.
+chat_module = types.ModuleType("langchain_openai")
+class ChatOpenAI:
+    def __init__(self, *args, **kwargs): pass
+chat_module.ChatOpenAI = ChatOpenAI
+sys.modules.setdefault("langchain_openai", chat_module)
+
+adapter_package = types.ModuleType("langchain_mcp_adapters")
+client_module = types.ModuleType("langchain_mcp_adapters.client")
+class MultiServerMCPClient:
+    def __init__(self, *args, **kwargs): pass
+client_module.MultiServerMCPClient = MultiServerMCPClient
+sys.modules.setdefault("langchain_mcp_adapters", adapter_package)
+sys.modules.setdefault("langchain_mcp_adapters.client", client_module)
+
+from agents.supervisor import _fallback_plan, _normalise_plan, TaskPlan, AgentTask
+from agents.researcher import parse_search_results, parse_fetched_page, _generic_relevance_score
+
+
+def check(value, message):
+    if not value:
+        raise AssertionError(message)
+
+# If the planning model is unavailable, preserve the general-purpose LLM path.
+# Do not route by hardcoded keywords or destination lists.
+for request in (
+    "What is Java?",
+    "What is Python?",
+    "What is an API?",
+    "What is the current news of Andhra Pradesh?",
+    "Plan a 3-day trip to Pondicherry",
+    "Compare two cloud platforms",
+    "Recommend places to visit near Gachibowli",
+):
+    plan = _fallback_plan(request)
+    check(not plan.needs_research, f"Fallback must not force a domain workflow: {request}")
+    check([task.agent for task in plan.tasks] == ["reporter"], "Fallback should preserve direct LLM answering")
+
+# When the Supervisor LLM is available, its dynamic structured plan is respected.
+proposed = TaskPlan(
+    goal="Plan a trip to Pondicherry", task_type="travel_planning",
+    needs_research=True, needs_analysis=True, needs_verification=False,
+    tasks=[AgentTask(agent="researcher", description="Research destination details"),
+           AgentTask(agent="analyst", description="Build an itinerary"),
+           AgentTask(agent="reporter", description="Present the itinerary")]
+)
+normalised = _normalise_plan(proposed, "Plan a trip to Pondicherry")
+check(normalised.needs_research and normalised.needs_analysis, "Supervisor research and analysis decisions should be preserved")
+check(normalised.task_type == "travel_planning", "Supervisor task type should be preserved")
+check([t.agent for t in normalised.tasks] == ["researcher", "analyst", "reporter"], "Only planned stages should run")
+
+# A weak planner result must not be silently overwritten by keyword heuristics.
+weak = TaskPlan(
+    goal="What is Java?", task_type="general_question", needs_research=False,
+    needs_analysis=False, needs_verification=False,
+    tasks=[AgentTask(agent="reporter", description="Answer directly")]
+)
+normalised_weak = _normalise_plan(weak, "What is Java?")
+check(not normalised_weak.needs_research, "Direct knowledge questions should stay on the LLM path")
+check([t.agent for t in normalised_weak.tasks] == ["reporter"], "Direct question should not trigger research agents")
+
+raw_search = """Result 1
+Title: Pondicherry travel guide
+URL: https://example.com/travel/pondicherry
+Description: Places to visit, beaches, heritage walks and practical travel information
+
+Result 2
+Title: Search results
+URL: https://example.com/search?q=pondicherry
+Description: Search page
+"""
+results = parse_search_results(raw_search)
+check(len(results) == 2, "Search parser should return both results")
+check(results[0]["url"].startswith("https://example.com/"), "URL parser failed")
+check(_generic_relevance_score(results[0], "Plan a trip to Pondicherry", ["Pondicherry travel guide"]) >
+      _generic_relevance_score(results[1], "Plan a trip to Pondicherry", ["Pondicherry travel guide"]),
+      "Specific content pages should rank above search directories")
+
+page = parse_fetched_page(
+    "PAGE TITLE:\nPondicherry Travel Guide\nPAGE URL:\nhttps://example.com/travel/pondicherry\n"
+    "PAGE PUBLISHED DATE:\n2026-11-04\nPAGE CONTENT:\nPromenade Beach is a popular waterfront destination.\n"
+    "PAGE LINKS:\nLINK: Visitor guide | https://example.com/visitor-guide",
+    "https://example.com/travel/pondicherry",
+)
+check(page["title"] == "Pondicherry Travel Guide", "Fetched page title parser failed")
+check("Promenade Beach" in page["text"], "Fetched page content parser failed")
+check(page["published_date"] == "2026-11-04", "Publication date parser failed")
+check(len(page["links"]) == 1, "Fetched page link parser failed")
+
+print("AgentFlow AI general-LLM routing smoke tests passed.")
